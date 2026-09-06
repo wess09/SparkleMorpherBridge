@@ -1,0 +1,14 @@
+.gradle/
+build/
+out/
+*.class
+*.jar
+*.ysm
+*.zip
+*.tsv
+*.log
+server-cache/
+models/
+uploads/
+lib/
+!gradle/wrapper/gradle-wrapper.jar

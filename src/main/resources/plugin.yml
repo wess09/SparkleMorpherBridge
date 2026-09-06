@@ -1,0 +1,18 @@
+name: SparkleMorpherBridge
+version: ${version}
+main: local.nanoda.sparklemorpher.SparkleMorpherBridgePlugin
+api-version: '1.21.11'
+folia-supported: true
+description: Folia bridge for Sparkle's Morpher Fabric 26.1.2 clients.
+commands:
+  sparklemorpher:
+    aliases: [spm]
+    description: Inspect the Sparkle Morpher Folia bridge.
+    permission: sparklemorpher.admin
+permissions:
+  sparklemorpher.admin:
+    description: Manage the Sparkle Morpher Folia bridge.
+    default: op
+  sparklemorpher.upload:
+    description: Upload models through the Sparkle Morpher Folia bridge.
+    default: true

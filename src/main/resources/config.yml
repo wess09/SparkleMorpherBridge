@@ -1,0 +1,10 @@
+# Sparkle Morpher Fabric 26.1.2 protocol 2.6.0 bridge.
+allow-model-upload: true
+max-model-bytes: 67108864
+upload-chunk-bytes: 24576
+upload-chunks-per-tick: 2
+upload-timeout-seconds: 300
+
+# Raw model files and generated Sparkle server-cache entries are held in
+# plugins/SparkleMorpherBridge. Clients receive the original encrypted model
+# download protocol on sparkle_morpher:2_6_0; no companion client build is used.

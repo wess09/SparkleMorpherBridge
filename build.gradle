@@ -1,0 +1,72 @@
+plugins {
+    id 'java'
+}
+
+group = 'local.nanoda'
+version = '0.3.2'
+
+def foliaApiJar = providers.gradleProperty('foliaApiJar')
+    .orElse(providers.environmentVariable('FOLIA_API_JAR'))
+    .orNull
+
+if (foliaApiJar == null || foliaApiJar.isBlank()) {
+    throw new GradleException('Set -PfoliaApiJar=/path/to/lophine-api.jar or FOLIA_API_JAR before building.')
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://jitpack.io' }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+dependencies {
+    compileOnly files(foliaApiJar)
+    compileOnly 'io.netty:netty-buffer:4.1.118.Final'
+    compileOnly 'io.netty:netty-common:4.1.118.Final'
+    compileOnly 'net.kyori:adventure-api:4.17.0'
+    compileOnly 'net.kyori:adventure-key:4.17.0'
+    compileOnly 'net.md-5:bungeecord-chat:1.20-R0.2'
+    compileOnly 'org.jetbrains:annotations:24.1.0'
+    compileOnly 'org.yaml:snakeyaml:2.2'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'org.joml:joml:1.10.5'
+    implementation 'com.github.TartaricAlkaline:ImageStream:-SNAPSHOT'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+    options.compilerArgs += ['-Xlint:-removal', '-Xlint:-unchecked']
+}
+
+tasks.processResources {
+    filesMatching('plugin.yml') {
+        expand(version: project.version)
+    }
+}
+
+tasks.register('fatJar', Jar) {
+    group = 'build'
+    description = 'Builds the deployable plugin JAR with runtime dependencies.'
+    archiveBaseName = 'SparkleMorpherBridge'
+    archiveVersion = project.version
+    archiveClassifier = ''
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes('Implementation-Title': project.name, 'Implementation-Version': project.version)
+    }
+    from sourceSets.main.output
+    dependsOn configurations.runtimeClasspath
+    from {
+        configurations.runtimeClasspath.collect { dependency ->
+            dependency.isDirectory() ? dependency : zipTree(dependency)
+        }
+    }
+}
+
+tasks.assemble.dependsOn(tasks.fatJar)
