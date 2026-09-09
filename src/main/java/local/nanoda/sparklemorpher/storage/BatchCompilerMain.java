@@ -11,7 +11,7 @@ public final class BatchCompilerMain {
         if (args.length != 1) {
             throw new IllegalArgumentException("Expected the SparkleMorpherBridge data directory");
         }
-        ModelStore store = new ModelStore(Path.of(args[0]), 64 * 1024 * 1024, 300);
+        ModelStore store = new ModelStore(Path.of(args[0]), 64 * 1024 * 1024, 300, Runnable::run);
         store.resetDerivedCatalog();
         ModelCompiler compiler = new ModelCompiler(store);
         int compiled = 0;

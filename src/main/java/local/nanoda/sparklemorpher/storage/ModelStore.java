@@ -1,6 +1,7 @@
 package local.nanoda.sparklemorpher.storage;
 
 import com.micaftic.morpher.core.security.YsmCrypt;
+import com.micaftic.morpher.resource.YSMFolderDeserializer;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -21,6 +22,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.HashSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.Base64;
 
@@ -28,6 +31,12 @@ import java.util.Base64;
 public final class ModelStore {
     private static final Pattern INVALID_MODEL_ID_CHARS = Pattern.compile("[^\\p{L}\\p{M}\\p{N}_./-]+");
     private static final Pattern MODEL_ID_PATTERN = Pattern.compile("[\\p{L}\\p{M}\\p{N}_./-]+");
+    /** Max pack icon bytes read from disk; anything larger cannot fit one plugin message anyway. */
+    private static final long MAX_ICON_BYTES = 1_048_000L;
+    /** Bound the Molang snapshot per (player, model) so a state frame can never overflow. */
+    private static final int MOLANG_VARS_MAX = 4096;
+    /** Bound one player's star set; far beyond real use yet always fits a single frame. */
+    private static final int MAX_STARS = 4096;
     private static final Pattern MODEL_ID_CONTENT_PATTERN = Pattern.compile(".*[\\p{L}\\p{N}].*");
     public record ModelFile(String modelId, String fileName, Path path, long size, String sha256) {
     }
@@ -38,8 +47,13 @@ public final class ModelStore {
     public record UploadResult(long id, byte status, String modelId, String message) {
     }
 
-    /** Metadata for a model already transformed into Sparkle's server-cache format. */
-    public record CompiledModel(String modelId, String modelHash, long hash1, long hash2, Path cacheFile, boolean auth) {
+    /**
+     * Metadata for a model already transformed into Sparkle's server-cache format.
+     * {@code sourceSha256} is the raw source file's hash at compile time, used to
+     * skip re-decoding unchanged models on later boots.
+     */
+    public record CompiledModel(String modelId, String modelHash, long hash1, long hash2, Path cacheFile,
+                                boolean auth, String sourceSha256) {
         public int modelHashId() {
             return Integer.parseUnsignedInt(modelHash.substring(0, 8), 16);
         }
@@ -56,13 +70,24 @@ public final class ModelStore {
                             String name, String description, Map<String, Map<String, String>> languages) {
     }
 
+    /**
+     * In-flight upload. The buffer is allocated lazily and only grows to the bytes
+     * actually received (chunks arrive strictly contiguous), so a client that begins
+     * an upload and never fills it reserves no memory — matching the official
+     * ModelUploadSession. {@code totalBytes} is the declared final size; {@code data}
+     * always holds exactly {@code received} bytes.
+     */
     private record Upload(UUID owner, String requestedId, String modelId, String fileName, String sha256,
-                          byte[] data, long lastTouched, int received) {
-        Upload touch() { return new Upload(owner, requestedId, modelId, fileName, sha256, data, System.currentTimeMillis(), received); }
+                          int totalBytes, byte[] data, long lastTouched, int received) {
+        Upload touch() {
+            return new Upload(owner, requestedId, modelId, fileName, sha256, totalBytes, data, System.currentTimeMillis(), received);
+        }
         Upload append(int offset, byte[] chunk) {
-            if (chunk == null || offset != received || offset < 0 || offset + chunk.length > data.length) return null;
-            System.arraycopy(chunk, 0, data, offset, chunk.length);
-            return new Upload(owner, requestedId, modelId, fileName, sha256, data, System.currentTimeMillis(), received + chunk.length);
+            if (chunk == null || offset != received || offset < 0 || received + chunk.length > totalBytes) return null;
+            int end = received + chunk.length;
+            byte[] grown = data.length >= end ? data : java.util.Arrays.copyOf(data, end);
+            System.arraycopy(chunk, 0, grown, offset, chunk.length);
+            return new Upload(owner, requestedId, modelId, fileName, sha256, totalBytes, grown, System.currentTimeMillis(), end);
         }
     }
 
@@ -78,12 +103,26 @@ public final class ModelStore {
     private final Map<UUID, MolangState> molangStates = new ConcurrentHashMap<>();
     private final Map<UUID, Set<String>> stars = new ConcurrentHashMap<>();
     private final Map<String, CompiledModel> compiledModels = new ConcurrentHashMap<>();
+    /** Raw source-file hashes whose compilation failed; retried only if the file changes. */
+    private final Map<String, String> failedSources = new ConcurrentHashMap<>();
     private final SecureRandom random = new SecureRandom();
     private final int maxBytes;
     private final long timeoutMillis;
     private final byte[] serverKey;
+    /**
+     * Dedicated single-thread executor for persisting per-player YAML (selections /
+     * stars / molang state). The store mutators run on Folia region threads and must
+     * never block on disk I/O; they only mark the file dirty and the writes happen
+     * here, coalesced to at most one in-flight snapshot per file.
+     */
+    private final Executor persistExecutor;
+    private final AtomicBoolean selectionsPending = new AtomicBoolean();
+    private final AtomicBoolean playerStatesPending = new AtomicBoolean();
+    private final AtomicBoolean starsPending = new AtomicBoolean();
+    /** Hard cap on concurrent in-flight upload sessions per player. */
+    private static final int MAX_UPLOADS_PER_PLAYER = 4;
 
-    public ModelStore(Path dataDirectory, int maxBytes, int timeoutSeconds) throws IOException {
+    public ModelStore(Path dataDirectory, int maxBytes, int timeoutSeconds, Executor persistExecutor) throws IOException {
         this.modelsDirectory = dataDirectory.resolve("models").toAbsolutePath().normalize();
         this.cacheDirectory = dataDirectory.resolve("server-cache").toAbsolutePath().normalize();
         this.selectionsFile = dataDirectory.resolve("selections.yml");
@@ -93,6 +132,7 @@ public final class ModelStore {
         this.serverKeyFile = dataDirectory.resolve("server-key.bin");
         this.maxBytes = maxBytes;
         this.timeoutMillis = timeoutSeconds * 1000L;
+        this.persistExecutor = persistExecutor;
         Files.createDirectories(modelsDirectory);
         Files.createDirectories(cacheDirectory);
         this.serverKey = loadOrCreateServerKey();
@@ -116,9 +156,13 @@ public final class ModelStore {
         if (Files.exists(target) || uploads.values().stream().anyMatch(upload -> upload.modelId.equals(modelId))) {
             return new UploadStart(0, (byte) 1, "Model ID already exists");
         }
+        long activeForOwner = uploads.values().stream().filter(upload -> upload.owner.equals(owner)).count();
+        if (activeForOwner >= MAX_UPLOADS_PER_PLAYER) {
+            return new UploadStart(0, (byte) 2, "Too many concurrent uploads");
+        }
         long id;
         do { id = random.nextLong(); } while (id == 0 || uploads.containsKey(id));
-        uploads.put(id, new Upload(owner, localId, modelId, safeFileName(localId, extension), sha256.toLowerCase(Locale.ROOT), new byte[totalBytes], System.currentTimeMillis(), 0));
+        uploads.put(id, new Upload(owner, localId, modelId, safeFileName(localId, extension), sha256.toLowerCase(Locale.ROOT), totalBytes, new byte[0], System.currentTimeMillis(), 0));
         return new UploadStart(id, (byte) 0, "");
     }
 
@@ -136,7 +180,7 @@ public final class ModelStore {
     public UploadResult finish(UUID owner, long uploadId) {
         Upload upload = uploads.remove(uploadId);
         if (upload == null || !upload.owner.equals(owner)) return new UploadResult(uploadId, (byte) 4, "", "Session expired");
-        if (upload.received != upload.data.length) return new UploadResult(uploadId, (byte) 5, "", "Incomplete upload");
+        if (upload.received != upload.totalBytes) return new UploadResult(uploadId, (byte) 5, "", "Incomplete upload");
         if (!upload.sha256.equals(sha256(upload.data))) return new UploadResult(uploadId, (byte) 1, "", "Hash mismatch");
         try {
             Path target = target(upload.modelId, extension(upload.fileName));
@@ -156,24 +200,98 @@ public final class ModelStore {
 
     public List<ModelFile> models() {
         List<ModelFile> models = new ArrayList<>();
-        try (var stream = Files.walk(modelsDirectory)) {
-            stream.filter(Files::isRegularFile).forEach(path -> {
-                try {
-                    String relative = modelsDirectory.relativize(path).toString().replace('\\', '/');
-                    String extension = extension(relative);
-                    if (extension.isEmpty()) return;
-                    String baseId = relative.substring(0, relative.length() - extension.length());
-                    String id = normalizeId(baseId);
-                    if (id != null) {
-                        models.add(new ModelFile(id, relative, path, Files.size(path), sha256(Files.readAllBytes(path))));
+        // Two intake shapes, mirroring what a real YSM server catalog accepts:
+        //  1. single-file releases (.ysm/.zip/.bbmodel/.gltf/.glb) anywhere
+        //     under the root;
+        //  2. the standard YSM folder library: a directory that carries a model
+        //     (ysm.json, or main.json + arm.json), as found inside model packs
+        //     next to their ysm-pack.json. Such folders are compiled by
+        //     YSMFolderDeserializer exactly like the mod server's
+        //     LocalModelScanner intake.
+        // A directory that already is a model folder is treated as opaque: its
+        // subtree is not scanned further. Otherwise the inner "models/"
+        // subfolder of a ysm.json-format pack (which contains main.json/arm.json)
+        // would be mis-detected as a second, contextless model folder and fail.
+        try {
+            Files.walkFileTree(modelsDirectory, new java.nio.file.SimpleFileVisitor<>() {
+                @Override
+                public java.nio.file.FileVisitResult preVisitDirectory(Path dir, java.nio.file.attribute.BasicFileAttributes attrs) {
+                    if (dir.equals(modelsDirectory)) {
+                        return java.nio.file.FileVisitResult.CONTINUE;
                     }
-                } catch (IOException ignored) {
+                    String relative = modelsDirectory.relativize(dir).toString().replace('\\', '/');
+                    if (YSMFolderDeserializer.isModelFolder(dir)) {
+                        String id = normalizeId(relative);
+                        if (id != null) {
+                            models.add(new ModelFile(id, relative, dir, 0L, sha256Folder(dir)));
+                        }
+                        return java.nio.file.FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return java.nio.file.FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public java.nio.file.FileVisitResult visitFile(Path file, java.nio.file.attribute.BasicFileAttributes attrs) {
+                    try {
+                        String relative = modelsDirectory.relativize(file).toString().replace('\\', '/');
+                        String extension = extension(relative);
+                        if (extension.isEmpty()) return java.nio.file.FileVisitResult.CONTINUE;
+                        String baseId = relative.substring(0, relative.length() - extension.length());
+                        String id = normalizeId(baseId);
+                        if (id != null) {
+                            models.add(new ModelFile(id, relative, file, Files.size(file), sha256(file)));
+                        }
+                    } catch (IOException ignored) {
+                    }
+                    return java.nio.file.FileVisitResult.CONTINUE;
                 }
             });
         } catch (IOException ignored) {
         }
         models.sort(Comparator.comparing(ModelFile::modelId));
         return List.copyOf(models);
+    }
+
+    /** Stable content hash over a model folder (sorted file bytes), used as its cache identity. */
+    private static String sha256Folder(Path folder) {
+        try {
+            List<Path> files;
+            try (var walk = Files.walk(folder)) {
+                files = walk.filter(Files::isRegularFile).sorted().toList();
+            }
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (Path file : files) {
+                try (java.io.InputStream in = Files.newInputStream(file)) {
+                    byte[] buffer = new byte[8192];
+                    int read;
+                    while ((read = in.read(buffer)) >= 0) {
+                        if (read > 0) digest.update(buffer, 0, read);
+                    }
+                }
+            }
+            StringBuilder result = new StringBuilder(64);
+            for (byte value : digest.digest()) result.append(String.format("%02x", value));
+            return result.toString();
+        } catch (Exception error) {
+            throw new IllegalStateException(error);
+        }
+    }
+
+    /** Streaming SHA-256 of a single file (avoids buffering the whole source for hashing). */
+    private static String sha256(Path file) {
+        try (java.io.InputStream in = Files.newInputStream(file)) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = in.read(buffer)) >= 0) {
+                if (read > 0) digest.update(buffer, 0, read);
+            }
+            StringBuilder result = new StringBuilder(64);
+            for (byte value : digest.digest()) result.append(String.format("%02x", value));
+            return result.toString();
+        } catch (Exception error) {
+            throw new IllegalStateException(error);
+        }
     }
 
     public ModelFile find(String modelId) {
@@ -198,7 +316,7 @@ public final class ModelStore {
      * Converts Sparkle's serialized model binary into the exact encrypted server-cache
      * container expected by the unmodified Fabric client.
      */
-    public synchronized CompiledModel publishCompiled(String modelId, String modelHash, byte[] serializedModel, boolean auth) throws Exception {
+    public synchronized CompiledModel publishCompiled(String modelId, String modelHash, byte[] serializedModel, boolean auth, String sourceSha256) throws Exception {
         if (normalizeId(modelId) == null) {
             throw new IllegalArgumentException("Invalid compiled model id");
         }
@@ -221,32 +339,81 @@ public final class ModelStore {
             byte[] cacheData = YsmCrypt.encryptServerCache(serializedModel, serverKey, hashes[0], hashes[1]);
             writeAtomically(target, cacheData);
         }
-        CompiledModel compiled = new CompiledModel(canonicalId, modelHash.toLowerCase(Locale.ROOT), hashes[0], hashes[1], target, auth);
+        CompiledModel compiled = new CompiledModel(canonicalId, modelHash.toLowerCase(Locale.ROOT), hashes[0], hashes[1],
+                target, auth, sourceSha256);
         compiledModels.put(canonicalId, compiled);
+        failedSources.remove(canonicalId);
         saveCatalog();
         return compiled;
+    }
+
+    /**
+     * True when the model is already compiled and the raw source bytes are
+     * unchanged since, so the boot scan can skip re-decoding it. Catalog entries
+     * written by older versions carry no {@code source-sha}; for those the file
+     * hash matching the recorded model hash still proves the file is untouched
+     * for legacy packages whose container hash doubles as their identity.
+     */
+    public boolean isUpToDate(String modelId, String sourceSha256) {
+        if (sourceSha256 == null) return false;
+        CompiledModel compiled = compiledModels.get(modelId);
+        if (compiled == null) return false;
+        if (sourceSha256.equals(compiled.sourceSha256())) return true;
+        return compiled.sourceSha256() == null && sourceSha256.equals(compiled.modelHash());
+    }
+
+    /** True when this exact source file already failed to compile on a prior boot. */
+    public boolean isKnownBad(String modelId, String sourceSha256) {
+        return sourceSha256 != null && sourceSha256.equals(failedSources.get(modelId));
+    }
+
+    public synchronized void clearFailure(String modelId) {
+        if (failedSources.remove(modelId) != null) saveCatalog();
+    }
+
+    public synchronized void rememberFailure(String modelId, String sourceSha256) {
+        if (sourceSha256 == null) return;
+        failedSources.put(modelId, sourceSha256);
+        saveCatalog();
     }
 
     public void setSelection(UUID playerId, String modelId, String textureId) {
         String canonicalId = normalizeId(modelId);
         if (canonicalId == null) return;
         selections.put(playerId, new Selection(canonicalId, textureId == null ? "" : textureId));
-        saveSelections();
+        scheduleSaveSelections();
     }
 
     public Selection selection(UUID playerId) {
         return selections.getOrDefault(playerId, new Selection("default", ""));
     }
 
+    /** The player's persisted star set (mirrors the official S2CSyncStarModelsPacket content). */
+    public Set<String> stars(UUID playerId) {
+        return stars.getOrDefault(playerId, Set.of());
+    }
+
     public void applyMolangState(UUID playerId, int modelHashId, Map<String, Float> values) {
         if (values == null || values.isEmpty()) return;
         molangStates.compute(playerId, (ignored, current) -> {
+            // Newest values first, then the older keys not overwritten; the map is
+            // capped so a single state frame can never grow past the plugin-message
+            // limit (and player-state.yml cannot grow without bound).
             Map<String, Float> merged = new java.util.LinkedHashMap<>();
-            if (current != null && current.modelHashId() == modelHashId) merged.putAll(current.values());
             merged.putAll(values);
-            return new MolangState(modelHashId, Map.copyOf(merged));
+            if (current != null && current.modelHashId() == modelHashId) {
+                for (Map.Entry<String, Float> entry : current.values().entrySet()) {
+                    if (!merged.containsKey(entry.getKey())) merged.put(entry.getKey(), entry.getValue());
+                }
+            }
+            Map<String, Float> capped = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, Float> entry : merged.entrySet()) {
+                if (capped.size() >= MOLANG_VARS_MAX) break;
+                capped.put(entry.getKey(), entry.getValue());
+            }
+            return new MolangState(modelHashId, Map.copyOf(capped));
         });
-        savePlayerStates();
+        scheduleSavePlayerStates();
     }
 
     public MolangState molangState(UUID playerId) {
@@ -263,15 +430,17 @@ public final class ModelStore {
                 if (!Files.isRegularFile(packJson)) return;
                 try {
                     JsonObject json = JsonParser.parseString(Files.readString(packJson)).getAsJsonObject();
-                    String name = json.has("name") ? json.get("name").toString() : null;
-                    String description = json.has("description") ? json.get("description").toString() : null;
+                    // getAsString (not toString): toString() keeps the JSON quotes,
+                    // which the client then displays literally.
+                    String name = json.has("name") ? json.get("name").getAsString() : null;
+                    String description = json.has("description") ? json.get("description").getAsString() : null;
                     Map<String, Map<String, String>> languages = new java.util.HashMap<>();
                     if (json.has("lang") && json.get("lang").isJsonObject()) {
                         for (Map.Entry<String, JsonElement> language : json.getAsJsonObject("lang").entrySet()) {
                             if (!language.getValue().isJsonObject()) continue;
                             Map<String, String> translations = new java.util.HashMap<>();
                             for (Map.Entry<String, JsonElement> entry : language.getValue().getAsJsonObject().entrySet()) {
-                                translations.put(entry.getKey(), entry.getValue().toString());
+                                translations.put(entry.getKey(), entry.getValue().getAsString());
                             }
                             languages.put(language.getKey(), Map.copyOf(translations));
                         }
@@ -280,7 +449,7 @@ public final class ModelStore {
                     int width = 0;
                     int height = 0;
                     Path iconFile = folder.resolve("ysm-pack.png");
-                    if (Files.isRegularFile(iconFile)) {
+                    if (Files.isRegularFile(iconFile) && Files.size(iconFile) <= MAX_ICON_BYTES) {
                         icon = Files.readAllBytes(iconFile);
                         int[] dimensions = pngDimensions(icon);
                         width = dimensions[0];
@@ -298,10 +467,14 @@ public final class ModelStore {
     public Set<String> updateStar(UUID playerId, String modelId, boolean add) {
         stars.compute(playerId, (ignored, values) -> {
             Set<String> updated = values == null ? new HashSet<>() : new HashSet<>(values);
-            if (add) updated.add(modelId); else updated.remove(modelId);
+            if (add) {
+                if (updated.size() < MAX_STARS) updated.add(modelId);
+            } else {
+                updated.remove(modelId);
+            }
             return Set.copyOf(updated);
         });
-        saveStars();
+        scheduleSaveStars();
         return stars.getOrDefault(playerId, Set.of());
     }
 
@@ -410,7 +583,16 @@ public final class ModelStore {
                         } catch (IllegalArgumentException ignored) { }
                     }
                 }
-                if (!values.isEmpty()) molangStates.put(playerId, new MolangState(modelHashId, Map.copyOf(values)));
+                if (!values.isEmpty()) {
+                    // Trim any oversized snapshot persisted by an older build so a
+                    // reloaded state frame can never exceed the message limit.
+                    Map<String, Float> capped = new java.util.LinkedHashMap<>();
+                    for (Map.Entry<String, Float> entry : values.entrySet()) {
+                        if (capped.size() >= MOLANG_VARS_MAX) break;
+                        capped.put(entry.getKey(), entry.getValue());
+                    }
+                    if (!capped.isEmpty()) molangStates.put(playerId, new MolangState(modelHashId, Map.copyOf(capped)));
+                }
             } catch (IllegalArgumentException ignored) { }
         }
     }
@@ -418,14 +600,19 @@ public final class ModelStore {
     private void loadCatalog() {
         YamlConfiguration yaml = YamlConfiguration.loadConfiguration(catalogFile.toFile());
         for (String id : yaml.getKeys(false)) {
+            // Compile failures are intentionally never persisted: catalog.yml holds
+            // only successfully compiled models. Each boot retries a failing source
+            // once (and logs one warning per boot for it).
             String modelHash = yaml.getString(id + ".model-hash");
+            if (modelHash == null || !modelHash.matches("[0-9a-fA-F]{64}")) continue;
             long hash1 = yaml.getLong(id + ".hash-1");
             long hash2 = yaml.getLong(id + ".hash-2");
             boolean auth = yaml.getBoolean(id + ".auth", false);
-            if (modelHash == null || !modelHash.matches("[0-9a-fA-F]{64}")) continue;
+            String sourceSha = yaml.getString(id + ".source-sha");
             Path cache = cacheDirectory.resolve(String.format("%016x%016x", hash1, hash2)).normalize();
             if (!cache.startsWith(cacheDirectory) || !Files.isRegularFile(cache)) continue;
-            compiledModels.put(id, new CompiledModel(id, modelHash, hash1, hash2, cache, auth));
+            compiledModels.put(id, new CompiledModel(id, modelHash, hash1, hash2, cache, auth,
+                    sourceSha == null || sourceSha.isEmpty() ? null : sourceSha));
         }
     }
 
@@ -443,7 +630,9 @@ public final class ModelStore {
             yaml.set(id + ".hash-1", model.hash1());
             yaml.set(id + ".hash-2", model.hash2());
             yaml.set(id + ".auth", model.auth());
+            if (model.sourceSha256() != null) yaml.set(id + ".source-sha", model.sourceSha256());
         });
+        // Failures are kept in memory only (per boot) and are never written out.
         try { yaml.save(catalogFile.toFile()); } catch (IOException ignored) { }
     }
 
@@ -473,7 +662,40 @@ public final class ModelStore {
         }
     }
 
-    private synchronized void saveSelections() {
+    private void scheduleSaveSelections() { scheduleSave(selectionsPending, this::writeSelections); }
+    private void scheduleSavePlayerStates() { scheduleSave(playerStatesPending, this::writePlayerStates); }
+    private void scheduleSaveStars() { scheduleSave(starsPending, this::writeStars); }
+
+    /**
+     * Queues a coalesced write of {@code write} onto the persist executor. At most
+     * one snapshot per file is in flight: further mutations while one is pending
+     * only update the in-memory maps, which the pending write reads at execution
+     * time, so the newest state is persisted without a per-mutation disk write.
+     */
+    private void scheduleSave(AtomicBoolean pending, Runnable write) {
+        if (!pending.compareAndSet(false, true)) {
+            return; // a snapshot write is already queued/running; it will pick up this change
+        }
+        try {
+            persistExecutor.execute(() -> {
+                try {
+                    write.run();
+                } catch (Throwable ignored) {
+                    // A disk failure must not take down the single persist thread.
+                } finally {
+                    pending.set(false);
+                }
+            });
+        } catch (RuntimeException rejected) {
+            // Executor already shut down (plugin disabling); drop persistence.
+            pending.set(false);
+        }
+    }
+
+    // The write methods are synchronized on the store so the single persist worker
+    // and a disable-time flush can never write the same YAML concurrently. Region
+    // threads never take this monitor — they only schedule through scheduleSave.
+    private synchronized void writeSelections() {
         YamlConfiguration yaml = new YamlConfiguration();
         selections.forEach((id, selection) -> {
             yaml.set(id + ".model", selection.modelId());
@@ -482,7 +704,7 @@ public final class ModelStore {
         try { yaml.save(selectionsFile.toFile()); } catch (IOException ignored) { }
     }
 
-    private synchronized void savePlayerStates() {
+    private synchronized void writePlayerStates() {
         YamlConfiguration yaml = new YamlConfiguration();
         molangStates.forEach((id, state) -> {
             yaml.set(id + ".model-hash", state.modelHashId());
@@ -494,9 +716,16 @@ public final class ModelStore {
         try { yaml.save(playerStateFile.toFile()); } catch (IOException ignored) { }
     }
 
-    private synchronized void saveStars() {
+    private synchronized void writeStars() {
         YamlConfiguration yaml = new YamlConfiguration();
         stars.forEach((id, values) -> yaml.set(id.toString(), List.copyOf(values)));
         try { yaml.save(starsFile.toFile()); } catch (IOException ignored) { }
+    }
+
+    /** Runs any pending per-player snapshot write synchronously (used on disable). */
+    public void flushPlayerStateSaves() {
+        writeSelections();
+        writeStars();
+        writePlayerStates();
     }
 }

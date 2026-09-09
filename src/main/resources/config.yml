@@ -1,9 +1,22 @@
 # Sparkle Morpher Fabric 26.1.2 protocol 2.6.0 bridge.
 allow-model-upload: true
 max-model-bytes: 67108864
-upload-chunk-bytes: 24576
-upload-chunks-per-tick: 2
+upload-chunk-bytes: 30720
+upload-chunks-per-tick: 4
 upload-timeout-seconds: 300
+
+# Server -> client model download pacing.
+# This is the maximum number of ~30 KiB model chunks handed to the network per
+# region tick (per player), a burst ceiling. The bridge additionally pauses
+# while a client's transport is full (its sync worker is still processing), so
+# real throughput self-adjusts to what each client can absorb and never floods
+# the client's bounded sync queue (which used to stall it into a keepalive
+# timeout kick). Raise the ceiling only if the host and network can carry it.
+download-chunks-per-tick: 16
+# How much of one player's download may sit pre-encrypted in the bridge's own
+# queue waiting to reach the network. Bounds RAM while streaming a large model
+# library; the transport watermark keeps actual in-flight bytes far lower.
+download-backlog-bytes: 786432
 
 # Raw model files and generated Sparkle server-cache entries are held in
 # plugins/SparkleMorpherBridge. Clients receive the original encrypted model
