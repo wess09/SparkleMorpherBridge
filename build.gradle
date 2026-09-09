@@ -72,4 +72,9 @@ tasks.register('fatJar', Jar) {
     }
 }
 
+// The plain java `jar` task and `fatJar` would both write to
+// build/libs/SparkleMorpherBridge-<version>.jar; disable the thin `jar` so
+// `assemble` deterministically produces the deployable fat jar (with runtime deps
+// such as Gson, JOML and ImageStream bundled) instead of being overwritten by it.
+tasks.named('jar', Jar).configure { enabled = false }
 tasks.assemble.dependsOn(tasks.fatJar)
