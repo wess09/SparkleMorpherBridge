@@ -227,80 +227,39 @@ public final class LegacySyncService {
         byte[] garbage = new byte[garbageLen];
         random.nextBytes(garbage);
 
-        // The manifest is one legacy frame, and the stock client decrypts and
-        // parses exactly one frame per sync step (no chunked manifest exists in
-        // the protocol). Bukkit hard-stops a single plugin message at 1 MiB, so
-        // the frame content is budgeted BEFORE the pack count is written (the
-        // client parses exactly `count` pack entries). Model entries are never
-        // trimmed. Pack entries that cannot be embedded with their icon (or at
-        // all on very large libraries) are re-pushed after the sync as full
-        // pack-entry frames (id 76), which newer clients upsert so every pack
-        // folder and icon still appears.
-        List<ModelStore.ModelPack> manifestPacks = new ArrayList<>();
-        List<Boolean> manifestWithIcon = new ArrayList<>();
-        List<ModelStore.ModelPack> deferredIcons = new ArrayList<>();
-        int deferredIconBytes = 0;
-        List<String> droppedPackFolders = new ArrayList<>();
-        List<ModelStore.ModelPack> droppedPacks = new ArrayList<>();
-        try (YSMByteBuf probe = new YSMByteBuf(Unpooled.buffer())) {
-            probe.writeGarbageHeader(garbageLen, garbage);
-            writeManifestPrefix(probe, session, models);
-            int fixedBytes = probe.getRawBuf().readableBytes();
-            int countBytes = varIntBytes(packs.size());
-            long remaining = MANIFEST_PLAINTEXT_BUDGET - fixedBytes - countBytes - 1L; // 1 = terminator
-            for (ModelStore.ModelPack pack : packs) {
-                int withIconSize = packSize(pack, true);
-                if (remaining >= withIconSize) {
-                    manifestPacks.add(pack);
-                    manifestWithIcon.add(Boolean.TRUE);
-                    remaining -= withIconSize;
-                    continue;
-                }
-                int withoutIconSize = packSize(pack, false);
-                if (remaining >= withoutIconSize) {
-                    manifestPacks.add(pack);
-                    manifestWithIcon.add(Boolean.FALSE);
-                    remaining -= withoutIconSize;
-                    if (pack.iconData() != null) {
-                        deferredIcons.add(pack);
-                        deferredIconBytes += pack.iconData().length;
-                    }
+        // The manifest is one legacy frame: the stock client decrypts and parses
+        // exactly one frame per sync step (no chunked manifest exists) and Bukkit
+        // hard-stops a single plugin message at 1 MiB. Every pack is therefore
+        // listed here with METADATA ONLY (no ysm-pack.png) so each category is
+        // always visible, and each pack icon is delivered afterwards as its own
+        // plaintext id-75 frame — the codec the unmodified client actually uses to
+        // patch the icon of an already-listed pack (the official server can embed
+        // icons inline only because it is not bound by the 1 MiB plugin-message
+        // limit; the bridge is, so it defers them instead of losing covers).
+        List<ModelStore.ModelPack> iconPacks = new ArrayList<>();
+        for (ModelStore.ModelPack pack : packs) {
+            if (pack.iconData() != null && pack.iconData().length > 0) {
+                if (pack.iconData().length <= ICON_FRAME_BUDGET) {
+                    iconPacks.add(pack);
                 } else {
-                    // Not even the metadata fits: drop the whole entry rather
-                    // than desync the entry count; it will be re-pushed in full
-                    // via the late pack-entry frames.
-                    droppedPackFolders.add(pack.folderPath());
-                    droppedPacks.add(pack);
+                    java.util.logging.Logger.getLogger("SparkleMorpherBridge")
+                            .log(Level.WARNING, "[SM] Pack icon {0} is {1} bytes and cannot fit a single plugin message "
+                                    + "(shrink ysm-pack.png to restore the preview).",
+                            new Object[]{pack.folderPath(), pack.iconData().length});
                 }
             }
-        }
-        Logger logger = java.util.logging.Logger.getLogger("SparkleMorpherBridge");
-        if (!deferredIcons.isEmpty()) {
-            logger.log(Level.WARNING, "[SM] Model manifest for {0} exceeded the 1 MiB plugin-message limit; deferred {1} "
-                            + "pack icons ({2} bytes) to late pack-entry frames (newer clients restore them after the "
-                            + "sync; older clients show no preview for those packs).",
-                    new Object[]{player.getName(), deferredIcons.size(), deferredIconBytes});
-            for (ModelStore.ModelPack pack : deferredIcons) {
-                logger.log(Level.FINE, "[SM] Icon deferred for pack {0} ({1} bytes)",
-                        new Object[]{pack.folderPath(), pack.iconData() == null ? 0 : pack.iconData().length});
-            }
-        }
-        if (!droppedPackFolders.isEmpty()) {
-            logger.log(Level.WARNING, "[SM] Model manifest for {0} dropped {1} pack entries entirely (metadata did not "
-                            + "fit the 1 MiB frame budget); they will be re-pushed as full entries for newer clients. "
-                            + "Affected packs: {2}",
-                    new Object[]{player.getName(), droppedPackFolders.size(), droppedPackFolders});
         }
         try (YSMByteBuf data = new YSMByteBuf(Unpooled.buffer())) {
             data.writeGarbageHeader(garbageLen, garbage);
             writeManifestPrefix(data, session, models);
-            data.writeVarInt(manifestPacks.size());
-            for (int index = 0; index < manifestPacks.size(); index++) {
-                writePack(data, manifestPacks.get(index), manifestWithIcon.get(index));
+            data.writeVarInt(packs.size());
+            for (ModelStore.ModelPack pack : packs) {
+                writePack(data, pack, false); // metadata only; icon follows as id-75
             }
             data.writeVarInt(0); // protocol terminator
             if (data.getRawBuf().readableBytes() > MANIFEST_PLAINTEXT_BUDGET) {
-                logger.log(Level.WARNING, "[SM] Model manifest for {0} is {1} bytes: the model catalog alone exceeds the "
+                java.util.logging.Logger.getLogger("SparkleMorpherBridge")
+                        .log(Level.WARNING, "[SM] Model manifest for {0} is {1} bytes: the model catalog alone exceeds the "
                                 + "1 MiB plugin-message limit and the sync frame will be refused (needs a chunked catalog "
                                 + "protocol beyond this).",
                         new Object[]{player.getName(), data.getRawBuf().readableBytes()});
@@ -308,18 +267,14 @@ public final class LegacySyncService {
             YsmCrypt.EncryptedPacket packet = YsmCrypt.encrypt(data.toArray(), session.manifestKey, false);
             send(player, packet.data());
         }
-        if (!deferredIcons.isEmpty() || !droppedPacks.isEmpty()) {
-            List<ModelStore.ModelPack> latePacks = new ArrayList<>(deferredIcons.size() + droppedPacks.size());
-            latePacks.addAll(deferredIcons);
-            latePacks.addAll(droppedPacks);
+        if (!iconPacks.isEmpty()) {
             try {
-                // Push every pack the manifest could not carry in full on the
-                // download pool so the manifest caller (region/control thread)
-                // never blocks on flow control. Newer clients upsert these
-                // entries, restoring every pack folder and its icon.
-                streamExecutor.execute(() -> streamLatePackEntries(player, session, List.copyOf(latePacks)));
+                // Push each pack icon on the download pool so the manifest caller
+                // (region/control thread) never blocks on flow control.
+                streamExecutor.execute(() -> streamPackIcons(player, session, List.copyOf(iconPacks)));
             } catch (RuntimeException error) {
-                logger.log(Level.FINE, "[SM] Could not schedule late pack entries for " + player.getName(), error);
+                java.util.logging.Logger.getLogger("SparkleMorpherBridge")
+                        .log(Level.FINE, "[SM] Could not schedule late pack icons for " + player.getName(), error);
             }
         }
     }
@@ -350,33 +305,21 @@ public final class LegacySyncService {
     }
 
     /**
-     * Pushes full pack entries the manifest could not carry (icons trimmed or
-     * whole packs dropped) as individual id-76 frames. Icons that could not fit
-     * one frame alone are sent as an entry without the icon so the folder still
-     * appears.
+     * Sends each pack icon as an id-75 S2CPackIconPacket frame. The pack was already
+     * listed (metadata only) in the manifest, so this patches its cover — this is the
+     * codec the unmodified client registers for exactly that purpose. The manifest
+     * caller (region/control thread) never blocks on flow control.
      */
-    private void streamLatePackEntries(Player player, Session session, List<ModelStore.ModelPack> packs) {
-        Logger logger = java.util.logging.Logger.getLogger("SparkleMorpherBridge");
+    private void streamPackIcons(Player player, Session session, List<ModelStore.ModelPack> packs) {
         try {
             for (ModelStore.ModelPack pack : packs) {
                 if (!isCurrentSession(player, session)) return;
                 awaitBacklogCapacity(player, session);
                 if (!isCurrentSession(player, session)) return;
                 byte[] icon = pack.iconData();
-                if (icon != null && icon.length > ICON_FRAME_BUDGET) {
-                    logger.log(Level.WARNING, "[SM] Pack icon {0} is {1} bytes and cannot fit a single plugin message; "
-                                    + "sending the pack without its icon (shrink ysm-pack.png to restore the preview).",
-                            new Object[]{pack.folderPath(), icon.length});
-                    icon = null;
-                }
-                byte[] frame = SparkleWire.encodePackEntry(pack.folderPath(), icon, pack.name(), pack.description(),
-                        pack.languages());
-                if (frame.length > SparkleWire.PLUGIN_MESSAGE_LIMIT) {
-                    logger.log(Level.WARNING, "[SM] Pack entry frame for {0} is {1} bytes and exceeds the plugin-message "
-                                    + "limit; skipping (pack will be missing on newer clients).",
-                            new Object[]{pack.folderPath(), frame.length});
-                    continue;
-                }
+                if (icon == null || icon.length == 0 || icon.length > ICON_FRAME_BUDGET) continue;
+                byte[] frame = SparkleWire.encodePackIcon(pack.folderPath(), icon);
+                if (frame.length > SparkleWire.PLUGIN_MESSAGE_LIMIT) continue;
                 sender.accept(player, frame);
             }
         } catch (Exception error) {
