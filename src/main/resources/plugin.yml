@@ -7,12 +7,30 @@ description: Folia bridge for Sparkle's Morpher Fabric 26.1.2 clients.
 commands:
   sparklemorpher:
     aliases: [spm]
-    description: Inspect the Sparkle Morpher Folia bridge.
-    permission: sparklemorpher.admin
+    description: Manage the Sparkle Morpher Folia bridge (models, packs, cache, players).
+    usage: /sparklemorpher <status|list|packs|model|get|uploads|cache|stats|session|stars|set|setall|clear|star|rescan|recompile|resync|packicon|verify|reload|delete|prune|rebuild|reset>
+    permission: sparklemorpher.command
 permissions:
-  sparklemorpher.admin:
-    description: Manage the Sparkle Morpher Folia bridge.
+  sparklemorpher.command:
+    description: Use the /sparklemorpher command (also implied by sparklemorpher.admin).
     default: op
+  sparklemorpher.read:
+    description: Read-only bridge diagnostics (status/list/packs/model/get/uploads/cache/stats/session/stars).
+    default: op
+  sparklemorpher.modify:
+    description: Change player selections/stars and run non-destructive catalog jobs (set/setall/clear/star/rescan/recompile/resync/packicon/verify/reload).
+    default: op
+  sparklemorpher.destructive:
+    description: Irreversible catalog operations (delete/prune/rebuild/reset, verify all).
+    default: op
+  sparklemorpher.admin:
+    description: Umbrella for all bridge management permissions.
+    default: op
+    children:
+      sparklemorpher.command: true
+      sparklemorpher.read: true
+      sparklemorpher.modify: true
+      sparklemorpher.destructive: true
   sparklemorpher.upload:
     description: Upload models through the Sparkle Morpher Folia bridge.
     default: true

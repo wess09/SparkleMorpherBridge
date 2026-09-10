@@ -114,6 +114,28 @@ public final class LegacySyncService {
         return session != null && session.busy;
     }
 
+    /** Largest icon byte length deliverable in one id-75 frame (see {@link #ICON_FRAME_BUDGET}). */
+    public static int iconFrameBudget() {
+        return ICON_FRAME_BUDGET;
+    }
+
+    /** Read-only snapshot of a player's sync session for the /spm session diagnostic. */
+    public record SessionInfo(boolean present, int step, boolean busy, boolean manifestSent,
+                              long queuedHashes, int pendingBatches, boolean packIconsResent, int packIcons) { }
+
+    public SessionInfo describe(Player player) {
+        Session session = player == null ? null : sessions.get(player.getUniqueId());
+        if (session == null) return new SessionInfo(false, 0, false, false, 0L, 0, false, 0);
+        long queued;
+        int pending;
+        synchronized (session) {
+            queued = session.queuedHashes;
+            pending = session.pendingRequests.size();
+        }
+        return new SessionInfo(true, session.step, session.busy, session.manifestSent,
+                queued, pending, session.packIconsResent, session.packIcons.size());
+    }
+
     public void accept(Player player, byte[] encryptedPayload) {
         if (player == null || encryptedPayload == null || encryptedPayload.length == 0) return;
         UUID playerId = player.getUniqueId();
@@ -148,6 +170,20 @@ public final class LegacySyncService {
                     session.queuedHashes += hashes.length;
                     if (session.busy) return; // the running worker will drain it
                     session.busy = true;
+                }
+                // The client's model request proves it has already processed the
+                // manifest (packs are indexed before it builds requests). The icon
+                // frames pushed right after the manifest can race AHEAD of the
+                // client's asynchronous manifest parsing and be discarded as
+                // "unknown pack", so re-push them once the packs are guaranteed
+                // indexed. Idempotent; done once per session.
+                final List<ModelStore.ModelPack> resendIcons = claimPackIconResend(session);
+                if (resendIcons != null) {
+                    try {
+                        streamExecutor.execute(() -> streamPackIcons(player, session, resendIcons));
+                    } catch (RuntimeException ignored) {
+                        // pool shutting down; the immediate push may already have landed
+                    }
                 }
                 try {
                     streamExecutor.execute(() -> streamRequests(player, session));
@@ -268,10 +304,12 @@ public final class LegacySyncService {
             send(player, packet.data());
         }
         if (!iconPacks.isEmpty()) {
+            session.packIcons = List.copyOf(iconPacks);
             try {
-                // Push each pack icon on the download pool so the manifest caller
-                // (region/control thread) never blocks on flow control.
-                streamExecutor.execute(() -> streamPackIcons(player, session, List.copyOf(iconPacks)));
+                // Best-effort immediate push; it may race ahead of the client's
+                // async manifest parsing and be dropped, so accept() re-pushes once
+                // the client's model request proves the packs are indexed.
+                streamExecutor.execute(() -> streamPackIcons(player, session, session.packIcons));
             } catch (RuntimeException error) {
                 java.util.logging.Logger.getLogger("SparkleMorpherBridge")
                         .log(Level.FINE, "[SM] Could not schedule late pack icons for " + player.getName(), error);
@@ -324,6 +362,20 @@ public final class LegacySyncService {
             }
         } catch (Exception error) {
             sessions.remove(player.getUniqueId(), session);
+        }
+    }
+
+    /**
+     * Returns the icon list to (re)push exactly once per session, or null if it was
+     * already pushed or there is nothing to push.
+     */
+    private static List<ModelStore.ModelPack> claimPackIconResend(Session session) {
+        synchronized (session) {
+            if (!session.packIconsResent && !session.packIcons.isEmpty()) {
+                session.packIconsResent = true;
+                return session.packIcons;
+            }
+            return null;
         }
     }
 
@@ -540,6 +592,10 @@ public final class LegacySyncService {
         private volatile boolean busy;
         /** Whether the type-3 manifest has already been emitted for this session. */
         private volatile boolean manifestSent;
+        /** Packs whose icons must be (re)pushed to this client; set when the manifest is sent. */
+        private volatile List<ModelStore.ModelPack> packIcons = List.of();
+        /** Whether the post-request icon re-push has already run for this session. */
+        private volatile boolean packIconsResent;
 
         private Session(byte[] clientKey) {
             this.clientKey = clientKey;

@@ -325,7 +325,7 @@ public final class ModelStore {
         }
         String canonicalId = normalizeId(modelId);
         long[] hashes = YsmCrypt.calculateModelHashes(modelHash, serverKey);
-        String cacheName = String.format("%016x%016x", hashes[0], hashes[1]);
+        String cacheName = cacheName(hashes[0], hashes[1]);
         Path target = cacheDirectory.resolve(cacheName).normalize();
         if (!target.startsWith(cacheDirectory)) throw new IllegalArgumentException("Cache path escapes storage");
         boolean validCache = false;
@@ -609,7 +609,7 @@ public final class ModelStore {
             long hash2 = yaml.getLong(id + ".hash-2");
             boolean auth = yaml.getBoolean(id + ".auth", false);
             String sourceSha = yaml.getString(id + ".source-sha");
-            Path cache = cacheDirectory.resolve(String.format("%016x%016x", hash1, hash2)).normalize();
+            Path cache = cacheDirectory.resolve(cacheName(hash1, hash2)).normalize();
             if (!cache.startsWith(cacheDirectory) || !Files.isRegularFile(cache)) continue;
             compiledModels.put(id, new CompiledModel(id, modelHash, hash1, hash2, cache, auth,
                     sourceSha == null || sourceSha.isEmpty() ? null : sourceSha));
@@ -720,6 +720,252 @@ public final class ModelStore {
         YamlConfiguration yaml = new YamlConfiguration();
         stars.forEach((id, values) -> yaml.set(id.toString(), List.copyOf(values)));
         try { yaml.save(starsFile.toFile()); } catch (IOException ignored) { }
+    }
+
+    // ------------------------------------------------------------------
+    // Admin / diagnostics surface. Read-only projections are safe on any
+    // thread; the destructive methods touch disk and MUST only run on the
+    // plugin's storage worker (never a Folia region thread).
+    // ------------------------------------------------------------------
+
+    /** Snapshot of one in-flight upload for the /spm uploads diagnostic. */
+    public record UploadInfo(long id, UUID owner, String modelId, String fileName,
+                             int receivedBytes, int totalBytes, long idleMillis, boolean expired) { }
+
+    /** server-cache/ census. orphans = files referenced by no CompiledModel. */
+    public record CacheStats(int files, long totalBytes, int orphans, long orphanBytes, int missingForCatalog) { }
+
+    /** Aggregate storage census for /spm stats. */
+    public record StorageStats(int sourceFiles, long sourceBytes, int compiledModels, long cacheBytes,
+                               int packs, int selections, int starSets, int molangStates) { }
+
+    /** Per-model cache verification. status: 0 ok, 1 corrupt, 2 unreadable, 3 missing, 4 decrypt-failed. */
+    public record CacheVerification(String modelId, byte status, long bytes, String detail) { }
+
+    /** Outcome of deleteModel(). */
+    public record DeleteResult(boolean sourceDeleted, boolean cacheDeleted, boolean catalogRowRemoved,
+                               int selectionsReset, String message) { }
+
+    /** Outcome of pruneCache(). */
+    public record PruneResult(int orphansDeleted, long bytesReclaimed, int catalogRowsDropped) { }
+
+    /** Cache file name derived from the model hash pair; the client requests exactly this. */
+    private static String cacheName(long hash1, long hash2) {
+        return String.format("%016x%016x", hash1, hash2);
+    }
+
+    /** Snapshot of in-flight uploads, sorted by id. Read-only: does NOT expire sessions. */
+    public List<UploadInfo> activeUploads() {
+        long now = System.currentTimeMillis();
+        List<UploadInfo> out = new ArrayList<>();
+        uploads.forEach((id, upload) -> out.add(new UploadInfo(id, upload.owner, upload.modelId, upload.fileName,
+                upload.received, upload.totalBytes, now - upload.lastTouched, now - upload.lastTouched > timeoutMillis)));
+        out.sort(Comparator.comparingLong(UploadInfo::id));
+        return List.copyOf(out);
+    }
+
+    /** Census of server-cache/ plus catalog entries whose cache file is missing. */
+    public CacheStats cacheStats() {
+        Set<Path> referenced = referencedCachePaths();
+        int files = 0, orphans = 0;
+        long totalBytes = 0L, orphanBytes = 0L;
+        if (Files.isDirectory(cacheDirectory)) {
+            try (var list = Files.list(cacheDirectory)) {
+                for (Path file : list.toList()) {
+                    if (!Files.isRegularFile(file)) continue;
+                    files++;
+                    long size;
+                    try { size = Files.size(file); } catch (IOException e) { size = 0L; }
+                    totalBytes += size;
+                    if (!referenced.contains(file.normalize())) { orphans++; orphanBytes += size; }
+                }
+            } catch (IOException ignored) { }
+        }
+        int missing = 0;
+        for (CompiledModel model : compiledModels.values()) {
+            if (!Files.isRegularFile(model.cacheFile())) missing++;
+        }
+        return new CacheStats(files, totalBytes, orphans, orphanBytes, missing);
+    }
+
+    /** Aggregate census across models/, server-cache/ and the in-memory player maps. */
+    public StorageStats storageStats() {
+        List<ModelFile> modelFiles = models();
+        long sourceBytes = 0L;
+        int sourceFiles = 0;
+        for (ModelFile model : modelFiles) {
+            if (Files.isDirectory(model.path())) continue; // folder models counted but have no single-file size
+            sourceFiles++;
+            sourceBytes += model.size();
+        }
+        return new StorageStats(sourceFiles, sourceBytes, compiledModels.size(), cacheStats().totalBytes(),
+                packs().size(), selections.size(), stars.size(), molangStates.size());
+    }
+
+    private Set<Path> referencedCachePaths() {
+        Set<Path> out = new HashSet<>();
+        for (CompiledModel model : compiledModels.values()) out.add(model.cacheFile().normalize());
+        return out;
+    }
+
+    /**
+     * Verifies one compiled model's cache file, or every one when {@code modelId} is
+     * null. Re-derives the CityHash signature and decrypts with the server key, so a
+     * corrupted or mis-keyed container is caught. Reads whole files: storage worker only.
+     */
+    public List<CacheVerification> verifyCache(String modelId) {
+        List<CacheVerification> out = new ArrayList<>();
+        if (modelId != null) {
+            String id = normalizeId(modelId);
+            CompiledModel model = compiledModels.get(id == null ? modelId : id);
+            if (model == null) { out.add(new CacheVerification(modelId, (byte) 3, 0L, "model not compiled")); return List.copyOf(out); }
+            out.add(verifyOne(model));
+            return List.copyOf(out);
+        }
+        for (CompiledModel model : compiledModels()) out.add(verifyOne(model));
+        return List.copyOf(out);
+    }
+
+    private CacheVerification verifyOne(CompiledModel model) {
+        Path file = model.cacheFile();
+        if (!Files.isRegularFile(file)) return new CacheVerification(model.modelId(), (byte) 3, 0L, "cache file missing");
+        byte[] data;
+        try { data = Files.readAllBytes(file); }
+        catch (IOException e) { return new CacheVerification(model.modelId(), (byte) 2, 0L, String.valueOf(e.getMessage())); }
+        if (!YsmCrypt.verifyServerCache(data, model.hash1(), model.hash2())) {
+            return new CacheVerification(model.modelId(), (byte) 1, data.length, "signature mismatch");
+        }
+        try {
+            byte[] clear = YsmCrypt.read(data, serverKey);
+            if (clear == null || clear.length == 0) return new CacheVerification(model.modelId(), (byte) 4, data.length, "empty payload");
+        } catch (Throwable t) {
+            return new CacheVerification(model.modelId(), (byte) 4, data.length, String.valueOf(t.getMessage()));
+        }
+        return new CacheVerification(model.modelId(), (byte) 0, data.length, "ok");
+    }
+
+    /**
+     * Removes one model: always drops the catalog row and (when unshared) its cache
+     * file; deletes the source under models/ only when {@code deleteSource} is true;
+     * resets every player selection that pointed at it. Storage worker only.
+     */
+    public synchronized DeleteResult deleteModel(String modelId, boolean deleteSource) throws IOException {
+        String id = normalizeId(modelId);
+        if (id == null) return new DeleteResult(false, false, false, 0, "invalid model id");
+        CompiledModel model = compiledModels.get(id);
+        boolean catalogRemoved = compiledModels.remove(id) != null;
+        failedSources.remove(id);
+        boolean cacheDeleted = false;
+        if (model != null) {
+            Path cache = model.cacheFile().normalize();
+            if (cache.startsWith(cacheDirectory) && !cachePathShared(cache, id) && Files.isRegularFile(cache)) {
+                Files.deleteIfExists(cache);
+                cacheDeleted = true;
+            }
+        }
+        boolean sourceDeleted = false;
+        if (deleteSource) {
+            ModelFile source = models().stream().filter(m -> m.modelId().equals(id)).findFirst().orElse(null);
+            if (source != null) { deleteSourceRecursively(source.path()); sourceDeleted = true; }
+        }
+        int reset = resetSelectionsFor(id);
+        saveCatalog();
+        if (!catalogRemoved && !sourceDeleted) return new DeleteResult(false, cacheDeleted, false, reset, "model not found");
+        return new DeleteResult(sourceDeleted, cacheDeleted, catalogRemoved, reset, "");
+    }
+
+    /** True when another compiled model resolves to the same cache file path. */
+    private boolean cachePathShared(Path cache, String exceptModelId) {
+        for (Map.Entry<String, CompiledModel> entry : compiledModels.entrySet()) {
+            if (!entry.getKey().equals(exceptModelId) && entry.getValue().cacheFile().normalize().equals(cache)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Drops only the derived state for one model (catalog row + unshared cache file);
+     * the source under models/ is left untouched so a later compile re-derives it.
+     * Returns the cache path removed, or null. Storage worker only.
+     */
+    public synchronized Path invalidateCompiled(String modelId) throws IOException {
+        String id = normalizeId(modelId);
+        if (id == null) return null;
+        CompiledModel model = compiledModels.get(id);
+        if (model == null) return null;
+        failedSources.remove(id);
+        Path cache = model.cacheFile().normalize();
+        Path removed = null;
+        if (cache.startsWith(cacheDirectory) && !cachePathShared(cache, id) && Files.isRegularFile(cache)) {
+            Files.deleteIfExists(cache);
+            removed = cache;
+        }
+        compiledModels.remove(id);
+        saveCatalog();
+        return removed;
+    }
+
+    /** Deletes server-cache/ files no compiled model references and drops catalog rows whose cache file is gone. */
+    public synchronized PruneResult pruneCache() throws IOException {
+        Set<Path> referenced = referencedCachePaths();
+        int deleted = 0;
+        long reclaimed = 0L;
+        if (Files.isDirectory(cacheDirectory)) {
+            try (var list = Files.list(cacheDirectory)) {
+                for (Path file : list.toList()) {
+                    if (!Files.isRegularFile(file) || referenced.contains(file.normalize())) continue;
+                    long size;
+                    try { size = Files.size(file); } catch (IOException e) { size = 0L; }
+                    if (Files.deleteIfExists(file)) { deleted++; reclaimed += size; }
+                }
+            }
+        }
+        int dropped = 0;
+        for (String id : new ArrayList<>(compiledModels.keySet())) {
+            CompiledModel model = compiledModels.get(id);
+            if (model != null && !Files.isRegularFile(model.cacheFile())) { compiledModels.remove(id); dropped++; }
+        }
+        if (dropped > 0) saveCatalog();
+        return new PruneResult(deleted, reclaimed, dropped);
+    }
+
+    /** Clears selection, stars and Molang state for one player. Returns the prior selection id. */
+    public String clearPlayerState(UUID playerId) {
+        if (playerId == null) return "default";
+        Selection prior = selections.getOrDefault(playerId, new Selection("default", ""));
+        selections.put(playerId, new Selection("default", ""));
+        molangStates.remove(playerId);
+        stars.remove(playerId);
+        scheduleSaveSelections();
+        scheduleSavePlayerStates();
+        scheduleSaveStars();
+        return prior.modelId();
+    }
+
+    /** Resets every stored selection that currently points at {@code modelId}; returns how many changed. */
+    public int resetSelectionsFor(String modelId) {
+        if (modelId == null) return 0;
+        int changed = 0;
+        for (Map.Entry<UUID, Selection> entry : selections.entrySet()) {
+            if (modelId.equals(entry.getValue().modelId())) {
+                entry.setValue(new Selection("default", ""));
+                changed++;
+            }
+        }
+        if (changed > 0) scheduleSaveSelections();
+        return changed;
+    }
+
+    /** Deletes a source file or folder under models/; refuses anything outside the models directory. */
+    private void deleteSourceRecursively(Path path) throws IOException {
+        Path normalized = path.toAbsolutePath().normalize();
+        if (!normalized.startsWith(modelsDirectory) || !Files.exists(normalized)) return;
+        if (Files.isDirectory(normalized)) {
+            List<Path> paths;
+            try (var walk = Files.walk(normalized)) { paths = walk.sorted(Comparator.reverseOrder()).toList(); }
+            for (Path p : paths) Files.deleteIfExists(p);
+        } else {
+            Files.deleteIfExists(normalized);
+        }
     }
 
     /** Runs any pending per-player snapshot write synchronously (used on disable). */
